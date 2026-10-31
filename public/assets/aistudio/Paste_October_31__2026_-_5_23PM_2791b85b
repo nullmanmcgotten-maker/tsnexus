@@ -1,0 +1,815 @@
+NEXUS × TONYBOT — Unified Multi-Market Trading Platform
+
+Technical Specification & Implementation Document (v1.0)
+
+Scope: Merge NEXUS (Binance Futures live engine) and TONYBOT (PySide6 GUI + strategy + backtest) into a single market-agnostic kernel with pluggable adapters for memecoins (Solana), Polymarket (prediction market), and perpetual futures (Binance). Add a self-evolving AI layer on free tiers, run a 3-week shadow-trading demo with P&L monitoring, then gate real money behind go/no-go criteria. Sports/event markets are a future expansion, not part of v1.0.
+
+Primary focus for v1.0: Memecoins + Polymarket. Perps are maintained and used as the "stable baseline" for validating the kernel. Sports/event expansion is Phase 6.
+
+---
+
+1. Executive Summary
+
+1.1 What we are building
+
+A single trading system where three fundamentally different markets are treated as notional exposure objects behind one interface. The kernel does not know what a "share" or a "contract" is—it knows USD notional, side, and a risk gate. Each market is an adapter.
+
+1.2 Why not just merge the repos
+
+NEXUS is a live execution engine (signed Binance requests, order lifecycle, SQLite journal, Telegram approval). TONYBOT is a strategy and research platform (GUI, indicators, regime classifier, backtester, ML ensemble, PDF reports). Copying files together produces two half-systems fighting for the main loop. The correct merge is:
+
+· Kernel ← NEXUS's order_lifecycle.py, journal.py, risk_governor.py (generalized to USD notional).
+· Strategy layer ← TONYBOT's regime_classifier.py, setup_scanner.py, signals.py, backtest/.
+· UI ← TONYBOT's PySide6 dashboard, extended with a market selector tab per adapter.
+· New ← three adapters, AI router, reflection loop, DSL engine, demo P&L tracker.
+
+1.3 Non-negotiable constraints
+
+Constraint Rule
+Secrets Never in source, logs, Telegram, or issue comments. .env + .gitignore only.
+Memecoin cap Hard $25 per trade during demo, independent of portfolio math.
+Safety filter order Runs before risk kernel, not after.
+Demo execution dry_run=True on all adapters for 3 weeks. Perps on Binance testnet.
+AI failure AI is optional enrichment. If all providers fail, deterministic rules continue.
+Real money One adapter at a time, after go/no-go. Polymarket first, perps last, memecoins last.
+
+---
+
+2. Target Repository Structure
+
+```text
+NEXUS-TONYBOT/
+├── main.py                      # GUI entry (from TONYBOT)
+├── cli.py                       # Headless entry (from TONYBOT)
+├── account_check.py             # Signed account validation (from NEXUS)
+├── requirements.txt
+├── .env.example
+├── .gitignore
+├── README.md
+├── run.bat / run_cli.bat / run_live.bat / build.bat   # from TONYBOT
+├── tonybot.spec                 # PyInstaller config
+│
+├── core/
+│   ├── kernel/
+│   │   ├── risk_engine.py       # Unified USD caps, circuit breakers
+│   │   ├── order_lifecycle.py   # PENDING→SUBMITTED→FILLED/REJECTED/UNKNOWN
+│   │   ├── journal.py           # SQLite, restart-safe
+│   │   ├── portfolio.py         # Cross-market exposure aggregation
+│   │   ├── message_bus.py       # Redis or SQLite queue between kernel & adapters
+│   │   └── config.py            # Unified settings loader
+│   │
+│   ├── adapters/
+│   │   ├── base.py              # AbstractAdapter interface
+│   │   ├── perp_binance.py      # Binance Futures (NEXUS lineage)
+│   │   ├── polymarket_clob.py   # Polymarket CLOB
+│   │   ├── solana_memecoin.py   # Jupiter swaps + safety filter
+│   │   └── registry.py          # Adapter discovery & health
+│   │
+│   ├── strategy/
+│   │   ├── regime_classifier.py # ADX+EMA (from TONYBOT)
+│   │   ├── setup_scanner.py     # 4-way scanner (from TONYBOT)
+│   │   ├── signals.py           # 7-indicator engine (from TONYBOT)
+│   │   ├── multitf.py           # Multi-timeframe confluence
+│   │   ├── dsl/
+│   │   │   ├── schema.py        # Strategy DSL dataclasses
+│   │   │   ├── compiler.py      # DSL → executable logic
+│   │   │   └── validator.py     # Schema + safety validation
+│   │   └── strategies/
+│   │       ├── perp_pullback.yaml
+│   │       ├── perp_breakout.yaml
+│   │       ├── poly_maker.yaml
+│   │       ├── poly_deviation.yaml
+│   │       └── meme_momentum.yaml
+│   │
+│   ├── risk/
+│   │   ├── risk_manager.py      # Drawdown breaker (from TONYBOT)
+│   │   ├── position_sizing.py   # Kelly + correlation penalty (from TONYBOT)
+│   │   ├── heat_guard.py        # Portfolio heat cap (from TONYBOT)
+│   │   └── market_limits.py     # Per-market sub-caps
+│   │
+│   ├── data/
+│   │   ├── ccxt_source.py       # Multi-exchange OHLCV (from TONYBOT)
+│   │   ├── binance_client.py    # Async Binance REST/WS (from TONYBOT)
+│   │   ├── polymarket_feed.py   # CLOB market data
+│   │   ├── solana_rpc.py        # RPC + priority fee
+│   │   └── coinscan.py          # Token safety scans
+│   │
+│   ├── ai/
+│   │   ├── router.py            # Free-tier failover
+│   │   ├── reflector.py         # Failed-trade diagnosis
+│   │   ├── event_analyst.py     # Polymarket probability estimate
+│   │   ├── reviewer.py          # Fine-tuned trade proposal reviewer
+│   │   └── cache.py             # Aggressive response caching
+│   │
+│   ├── exchanges/
+│   │   ├── manager.py           # Multi-exchange router (from TONYBOT)
+│   │   └── smart_order.py       # TWAP + slippage (from TONYBOT)
+│   │
+│   ├── orderflow/pipeline.py    # CVD, large trades (from TONYBOT)
+│   ├── orderbook/orderbook.py   # L2 depth, VPIN (from TONYBOT)
+│   ├── ml/ensemble.py           # LightGBM classifier (from TONYBOT)
+│   ├── backtest/
+│   │   ├── engine.py            # Fee + slippage backtester (from TONYBOT)
+│   │   └── optimizer.py         # Optuna (from TONYBOT)
+│   │
+│   ├── demo/
+│   │   ├── pnl_tracker.py       # Shadow-fill accounting
+│   │   ├── reconciler.py        # Manual spot-check tool
+│   │   └── report.py            # Daily CSV/PDF summary
+│   │
+│   ├── alerts/notifier.py       # Telegram & Email (from TONYBOT/NEXUS)
+│   ├── reports/generator.py     # Monthly PDF (from TONYBOT)
+│   ├── themes/manager.py        # GUI themes (from TONYBOT)
+│   └── ui/main_window.py        # PySide6 dashboard (from TONYBOT)
+│
+├── tests/
+│   ├── test_risk_engine.py
+│   ├── test_adapter_contract.py
+│   ├── test_dsl_compiler.py
+│   ├── test_safety_filter.py
+│   └── fixtures/
+│
+├── data/                        # Runtime DBs, caches
+│   ├── journal.db
+│   ├── shadow_pnl.db
+│   └── ai_cache.db
+│
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── ADAPTERS.md
+    ├── AI_LAYER.md
+    ├── DEMO_PLAN.md
+    └── GO_NOGO.md
+```
+
+Migration note: keep NEXUS and TONYBOT as read-only reference repos during construction. Do not git merge—copy files with history comments where needed. Delete the stray =6.0.0 file from TONYBOT root.
+
+---
+
+3. Kernel Design
+
+3.1 Adapter interface (frozen contract)
+
+```python
+# core/adapters/base.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+
+class Side(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+class Market(str, Enum):
+    PERP = "perp_binance"
+    POLYMARKET = "polymarket"
+    MEMECOIN = "solana_memecoin"
+
+@dataclass
+class Quote:
+    adapter: Market
+    symbol: str
+    side: Side
+    price: float            # Polymarket: 0.00–1.00 probability
+    size: float             # shares / contracts / tokens
+    notional_usd: float     # ALWAYS the authoritative number for risk
+    slippage_bps: float = 0.0
+    metadata: dict = field(default_factory=dict)
+
+@dataclass
+class OrderResult:
+    order_id: str | None
+    status: str             # FILLED | PARTIAL | REJECTED | UNKNOWN
+    filled_size: float
+    avg_price: float | None
+    raw: dict = field(default_factory=dict)
+
+class BaseAdapter(ABC):
+    market: Market
+
+    @abstractmethod
+    async def health(self) -> dict: ...
+
+    @abstractmethod
+    async def get_balance_usd(self) -> float: ...
+
+    @abstractmethod
+    async def quote(self, symbol: str, side: Side, notional_usd: float) -> Quote: ...
+
+    @abstractmethod
+    async def submit(self, quote: Quote, dry_run: bool = True) -> OrderResult: ...
+
+    @abstractmethod
+    async def cancel(self, order_id: str) -> bool: ...
+
+    @abstractmethod
+    async def positions(self) -> list[dict]: ...
+```
+
+Contract tests in tests/test_adapter_contract.py run identical assertions against all three adapters in dry-run mode:
+
+1. quote() returns notional_usd within 1% of price * size.
+2. submit(dry_run=True) never emits a network write call (assert via mock transport).
+3. positions() returns a list of dicts with {market, symbol, size, notional_usd, entry_price}.
+4. quote() for notional_usd above the adapter's hard cap raises CapExceeded.
+
+3.2 Order lifecycle (generalized from NEXUS)
+
+```text
+PROPOSED → GATED → APPROVED → SUBMITTED → FILLED
+                    │            │
+                    │            ├→ PARTIAL → FILLED / CANCELLED
+                    │            ├→ REJECTED
+                    │            └→ UNKNOWN → RECONCILED
+                    └→ BLOCKED (risk / safety / AI reviewer)
+```
+
+Every transition writes to journal.db with timestamp, adapter, reason code, and raw payload. On restart, journal.recover() re-reads any SUBMITTED/UNKNOWN rows and queries the adapter for ground truth.
+
+3.3 Journal schema
+
+```sql
+CREATE TABLE orders (
+    id            TEXT PRIMARY KEY,        -- uuid
+    adapter       TEXT NOT NULL,
+    symbol        TEXT NOT NULL,
+    side          TEXT NOT NULL,
+    notional_usd  REAL NOT NULL,
+    price         REAL,
+    size          REAL,
+    status        TEXT NOT NULL,
+    reason_code   TEXT,
+    strategy_id   TEXT,
+    parent_id     TEXT,                    -- for OCO / brackets
+    raw_request   TEXT,
+    raw_response  TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE positions (
+    id            TEXT PRIMARY KEY,
+    adapter       TEXT NOT NULL,
+    symbol        TEXT NOT NULL,
+    size          REAL NOT NULL,
+    entry_price   REAL NOT NULL,
+    notional_usd  REAL NOT NULL,
+    opened_at     TEXT NOT NULL,
+    closed_at     TEXT,
+    pnl_usd       REAL,
+    strategy_id   TEXT
+);
+
+CREATE TABLE strategy_versions (
+    id            TEXT PRIMARY KEY,        -- e.g. meme_momentum_v3
+    dsl_yaml      TEXT NOT NULL,
+    parent_id     TEXT,
+    created_by    TEXT,                    -- "human" | "reflector"
+    backtest_win_rate REAL,
+    backtest_sharpe   REAL,
+    approved      INTEGER DEFAULT 0,       -- 1 after OOS validation
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE reflections (
+    id            TEXT PRIMARY KEY,
+    trade_id      TEXT NOT NULL,
+    diagnosis     TEXT,
+    param_changed TEXT,
+    old_value     TEXT,
+    new_value     TEXT,
+    proposed_strategy_version TEXT,
+    accepted      INTEGER DEFAULT 0
+);
+```
+
+3.4 Message bus
+
+Run each adapter as a separate process. Kernel communicates via Redis (preferred) or SQLite queue for the demo. Benefits: one adapter crash does not kill the others; restart is independent; per-adapter rate limits are isolated.
+
+Channels: nexus.quotes.{market}, nexus.orders.{market}, nexus.fills.{market}, nexus.health.
+
+---
+
+4. Risk Kernel (single source of "no")
+
+```python
+# core/kernel/risk_engine.py
+class RiskEngine:
+    def __init__(self, cfg):
+        self.max_total_exposure_pct = cfg.TOTAL_EXPOSURE_PCT        # 0.30
+        self.market_caps = {
+            Market.PERP:       0.15,
+            Market.POLYMARKET: 0.10,
+            Market.MEMECOIN:   0.05,
+        }
+        self.max_daily_loss_pct     = cfg.DAILY_LOSS_PCT            # 0.02
+        self.max_drawdown_pct       = cfg.MAX_DRAWDOWN_PCT          # 0.15
+        self.hard_caps_usd = {
+            Market.MEMECOIN:   cfg.MEME_HARD_CAP_USD,               # 25
+            Market.POLYMARKET: cfg.POLY_HARD_CAP_USD,               # 100
+            Market.PERP:       cfg.PERP_HARD_CAP_USD,               # 500
+        }
+
+    async def gate(self, q: Quote) -> tuple[bool, str]:
+        capital = await self.portfolio.total_capital_usd()
+        total   = await self.portfolio.total_exposure_usd()
+
+        if q.notional_usd > self.hard_caps_usd[q.adapter]:
+            return False, "hard_cap_exceeded"
+
+        if total + q.notional_usd > capital * self.max_total_exposure_pct:
+            return False, "total_exposure_cap"
+
+        mkt = await self.portfolio.market_exposure_usd(q.adapter)
+        if mkt + q.notional_usd > capital * self.market_caps[q.adapter]:
+            return False, "market_cap_exceeded"
+
+        if await self.journal.daily_loss_pct() >= self.max_daily_loss_pct:
+            return False, "daily_loss_breaker"
+
+        if await self.journal.drawdown_pct() >= self.max_drawdown_pct:
+            return False, "drawdown_breaker"
+
+        return True, "approved"
+```
+
+Additional gate for perps only: funding-cost budget. A funding_watch coroutine polls every 60s; if projected daily funding cost on open positions exceeds FUNDING_BUDGET_USD, new entries are blocked with reason funding_budget.
+
+Additional gate for memecoins: the safety filter result must be passed on the same Quote.metadata["safety"] object. The risk engine checks this field before anything else.
+
+---
+
+5. Adapter Specifications
+
+5.1 Perp adapter (perp_binance)
+
+Inherits from NEXUS: live/binance_futures.py, account_validator.py, risk_governor.py logic folded into kernel.
+
+Item Detail
+Auth X-MBX-APIKEY header + HMAC-SHA256 signature
+Demo endpoint wss://testnet.binancefuture.com/ws-fapi/v1
+Order method order.place over WebSocket API; JSON id echoed in response
+Rate limit Token bucket, never reuse id before response
+Symbols BTCUSDT, ETHUSDT only for demo (limit complexity)
+Funding Poll premiumIndex every 60s; feed to risk
+Liquidation Poll positionRisk; alert if margin ratio < 0.20
+
+Deliverables for week 1: testnet round-trip order, journal reconciliation, funding watcher.
+
+5.2 Polymarket adapter (polymarket_clob)
+
+Polymarket is event-probability trading, not price-series trading. Strategy inputs are: CLOB midpoint, order book depth, time to resolution, external probability estimate (AI), and liquidity reward score.
+
+Authentication (two layers):
+
+· L1: EIP-712 wallet signature → create_or_derive_api_key() → {api_key, api_secret, api_passphrase}.
+· L2: HMAC-SHA256 per request using derived creds. Required for all order create/cancel.
+
+```python
+from py_clob_client_v2 import (
+    ClobClient, OrderArgs, MarketOrderArgs, OrderType,
+    PartialCreateOrderOptions, Side as ClobSide
+)
+
+client = ClobClient(host=HOST, chain_id=137, key=PRIVATE_KEY, creds=creds)
+
+def place_limit(token_id: str, price: float, size: float, side: str):
+    return client.create_and_post_order(
+        order_args=OrderArgs(token_id=token_id, price=price, size=size,
+                             side=ClobSide.BUY if side == "BUY" else ClobSide.SELL),
+        options=PartialCreateOrderOptions(tick_size="0.01"),
+        order_type=OrderType.GTC,
+    )
+```
+
+Order type Semantics Use in demo
+GTC Resting limit until cancelled Default. All quoted orders.
+FOK Fill-or-kill (market) Prohibited in demo
+FAK Fill-and-kill (market, partial ok) Prohibited in demo
+GTD Good-till-date Allowed for event markets with known resolution
+
+v1.0 strategy: passive two-sided market making on 3–5 high-liquidity markets. Quote within 20 bps of midpoint, refresh on midpoint move > 1 cent, cancel on adverse selection. This produces a non-directional P&L stream which is ideal for validating kernel accounting.
+
+Notional conversion: notional_usd = price * size (USDC). The adapter rejects any quote where price < 0.02 or price > 0.98 (near-resolution markets, extreme risk).
+
+5.3 Memecoin adapter (solana_memecoin)
+
+Highest risk. Gated hardest. Never live without the safety filter.
+
+Swap path (Jupiter):
+
+1. GET https://api.jup.ag/swap/v1/quote?inputMint=...&outputMint=...&amount=...&slippageBps=... — or https://lite-api.jup.ag/swap/v1 keyless fallback.
+2. POST /swap with userPublicKey and quote response → serialized tx.
+3. Add priority fee from getRecentPrioritizationFees (median of recent slots × factor).
+4. Sign and send via dedicated RPC (Helius/QuickNode free tier), not public endpoint.
+
+Mandatory safety filter:
+
+```python
+# core/data/coinscan.py
+THRESHOLDS = {
+    "p_rug":            0.15,
+    "bundle_pct":       0.40,
+    "sniper_pct":       0.30,
+    "top10_holder_pct": 0.50,
+}
+
+async def safety_scan(mint: str) -> dict:
+    scan = await cs.scan(mint)
+    reasons = []
+    if scan["ai_predictions"]["p_rug"] > THRESHOLDS["p_rug"]:
+        reasons.append("p_rug")
+    if scan["holders"]["bundle_pct"] > THRESHOLDS["bundle_pct"]:
+        reasons.append("bundle")
+    if scan["holders"]["sniper_pct"] > THRESHOLDS["sniper_pct"]:
+        reasons.append("sniper")
+    if not scan.get("lp_lock", {}).get("locked"):
+        reasons.append("lp_unlocked")
+    if scan.get("flags", {}).get("honeypot"):
+        reasons.append("honeypot")
+    return {"passed": len(reasons) == 0, "reasons": reasons, "raw": scan}
+```
+
+Free-tier constraint: coinscan-sdk free tier ≈ 25 scans/day. Adapter enforces a daily scan counter and refuses to quote beyond it. Budget accordingly: 25 candidate tokens/day maximum during demo.
+
+Hard rules:
+
+Rule Value
+Per-trade hard cap $25 (demo)
+Daily new positions ≤ 3
+Max hold time 30 minutes
+Slippage cap 300 bps
+Allowed DEX Jupiter only (v1.0)
+Forbidden Any token < 24h old, any token without LP lock
+
+Strategy meme_momentum.yaml: safety filter passed + volume spike > 1.5× 20-period average + RSI(7) < 30 on 1m. Exit: stop-loss 2× ATR(1m), take-profit 2R, hard timeout 30 min.
+
+---
+
+6. Strategy DSL
+
+6.1 Why DSL
+
+Free-tier LLMs cannot reliably write Python trading code. They can reliably edit YAML parameters within a known schema. The DSL is the boundary: LLM proposes DSL changes, kernel compiles and backtests, only approved versions run live.
+
+6.2 Schema (Pydantic)
+
+```python
+# core/strategy/dsl/schema.py
+class Trigger(BaseModel):
+    indicator: Literal["rsi", "macd", "volume_spike", "price_above_ema",
+                       "bb_breakout", "prob_deviation", "time_to_resolution"]
+    params: dict
+    condition: str          # e.g. "< 30", "> 1.5", "abs() > 0.08"
+
+class Guard(BaseModel):
+    name: Literal["safety_filter", "max_notional_usd", "regime",
+                  "liquidity_min_usd", "funding_budget"]
+    params: dict
+
+class Exit(BaseModel):
+    stop_loss: dict | None
+    take_profit: dict | None
+    timeout_minutes: int | None
+
+class StrategyDSL(BaseModel):
+    id: str
+    market: Literal["perp_binance", "polymarket", "solana_memecoin"]
+    triggers: list[Trigger]
+    guards: list[Guard]
+    exit: Exit
+    params: dict[str, float]   # tunable parameters, ranges declared
+    param_ranges: dict[str, tuple[float, float]]
+```
+
+6.3 Compiler and validator
+
+compiler.py produces a callable evaluate(context) -> Signal | None. validator.py enforces:
+
+1. Every param key has a matching param_range.
+2. Every Trigger.indicator is implemented for that market (Polymarket has no RSI).
+3. Guards include safety_filter for solana_memecoin.
+4. max_notional_usd guard present and ≤ hard cap.
+
+A DSL that fails validation cannot be loaded. This is the safety boundary against LLM mutation drift.
+
+6.4 Backtest gate for every version
+
+Any new strategy_versions row from reflector must pass:
+
+· Out-of-sample window ≥ 90 days.
+· Win rate ≥ baseline − 3 percentage points, OR Sharpe improvement ≥ 0.15.
+· Max drawdown ≤ current version + 20% relative.
+
+Failing rows stay approved=0 and are never loaded by the live engine.
+
+---
+
+7. AI Layer (Free Tiers Only)
+
+7.1 Router with cascade failover
+
+```python
+# core/ai/router.py
+PROVIDERS = [
+    ("groq",     "https://api.groq.com/openai/v1",                   "openai/gpt-oss-120b"),
+    ("gemini",   "https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.5-flash"),
+    ("cerebras", "https://api.cerebras.ai/v1",                       "llama-3.3-70b"),
+    ("mistral",  "https://api.mistral.ai/v1",                        "mistral-small-latest"),
+]
+
+async def ask(prompt: str, max_tokens: int = 256, json_mode: bool = False) -> str:
+    for name, base, model in PROVIDERS:
+        try:
+            r = await client.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {os.environ[f'{name.upper()}_API_KEY']}"},
+                json={"model": model, "temperature": 0.1, "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+        except Exception:
+            continue
+    return ""
+```
+
+Caching: ai/cache.py keys on sha256(prompt) with TTL. Polymarket event analysis TTL = 1 hour. Reflection TTL = never (unique per trade). Cache hits avoid rate-limit exhaustion.
+
+7.2 Layer 1 — Reflector (Week 2 onward)
+
+After each closed losing trade, reflect_failed_trade() sends the trade record + current strategy params to the router and asks for one parameter change. The response is stored in reflections with accepted=0. A background job backtests the proposed variant; if it passes the gate, it becomes a new strategy_versions row.
+
+```python
+async def reflect_failed_trade(trade: dict, strategy: dict) -> dict:
+    prompt = f"""Diagnose this failed trade and propose exactly ONE parameter change.
+Trade: {json.dumps(trade)}
+Current params: {json.dumps(strategy['params'])}
+Ranges: {json.dumps(strategy['param_ranges'])}
+Return JSON only: {{"diagnosis":"...","param":"...","old":...,"new":...}}"""
+    raw = await ask(prompt, json_mode=True)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"diagnosis": "parse_failed", "accepted": False}
+```
+
+7.3 Layer 2 — Event analyst (Polymarket)
+
+Given a market title + optional recent news snippet, ask for a probability estimate in [0,1]. Compare to CLOB midpoint. If |estimate − midpoint| > 0.08 and time-to-resolution > 7 days, emit a poly_deviation signal candidate.
+
+Guardrail: the analyst output cannot bypass the risk kernel or the minimum-liquidity guard. It only generates candidates.
+
+7.4 Layer 3 — Fine-tuned reviewer (post-demo, Phase 5)
+
+After 3 weeks of shadow trading, you have ~200–500 labeled trade records. Fine-tune an 8B open model (Llama 3.1 8B or Qwen 2.5) with QLoRA on a single 16–24GB GPU:
+
+· Format: {"messages":[system, user: trade proposal + context, assistant: "REJECT. reason: ..."]}
+· Labels: auto-derived from realized P&L + safety filter outcomes.
+· Inference: a fast local model invoked before risk gate. Reject → BLOCKED with ai_reviewer.
+
+Critical: the reviewer can only reject, never approve. Approval is always the risk engine's job. This preserves the hard caps even if the model is wrong.
+
+---
+
+8. Indicators and Strategies — What to Add, What to Skip
+
+Keep from TONYBOT (7 indicators): RSI, MACD, Bollinger, Supertrend, VWAP, Stochastic, EMA Cross. Do not add more price indicators.
+
+Add — market structure features (per market):
+
+Market Additions
+Perp Funding rate Z-score, long/short ratio extremes, liquidation heatmap density
+Polymarket Probability velocity (first derivative), book depth, time-to-resolution decay
+Memecoin Holder concentration delta, large-holder sell events, LP lock status
+
+Strategies per market (v1.0):
+
+· Perp: existing PERP_PULLBACK and PERP_BREAKOUT from TONYBOT's setup scanner, plus funding_budget guard.
+· Polymarket: poly_maker (two-sided quoter) and poly_deviation (AI-assisted).
+· Memecoin: meme_momentum (safety + volume + short-term momentum, 30-min max hold).
+
+What NOT to do: do not force one strategy across markets. Microstructure differs fundamentally; a unified strategy will be mediocre everywhere.
+
+---
+
+9. Three-Week Demo Plan (P&L Monitoring)
+
+All adapters run dry_run=True. Perps on testnet. Memecoins log proposals only (no execution). Polymarket builds and cancels orders against the real CLOB but with dry_run interception—never submits.
+
+Week 1 — Kernel validation (perp + polymarket)
+
+Day Task Success criteria
+1–2 Perp adapter on Binance testnet. Place, fill, cancel. Journal matches testnet responses; restart recovers open orders.
+3–4 Polymarket L1/L2 auth + build GTC order; intercept before submit. Shadow fill recorded at best bid/ask; auth flow verified read-only.
+5–7 Both adapters + risk kernel concurrently. No order exceeds market cap; total ≤ 30%; daily loss breaker fires on simulated breach.
+
+Week 2 — Memecoin adapter + reflection loop
+
+Day Task Success criteria
+8–9 Jupiter quotes for 20 tokens. Quote < 3s p95; priority fee sensible.
+10–11 Safety filter with coinscan-sdk (25/day). ≥ 1 known bad token rejected from test list.
+12–14 All three adapters shadow; reflector active on perp losses. Meme hard cap enforced; reflector proposals logged with accepted=0.
+
+Week 3 — Full shadow run + reconciliation
+
+Day Task Success criteria
+15–18 Continuous 72h+ run, AI router active. No crashes; journal consistent across restarts.
+19–20 P&L reconciliation: manual spot-check 10 random shadow trades per market. Shadow fill within 5 bps of recorded best bid/ask.
+21 Final demo report → go/no-go. See §9.1.
+
+9.1 Go/no-go criteria
+
+1. Shadow P&L positive or explainably neutral in ≥ 2 of 3 markets. Negative memecoin P&L acceptable only if the safety filter demonstrably blocked worse trades. Negative perp or Polymarket P&L = red flag.
+2. Zero risk-gate breaches (no order exceeded any cap).
+3. Journal integrity across a mid-run restart.
+4. Safety filter efficacy: ≥ 3 of 25 daily scans rejected (if never rejects, threshold too loose or filter not wired).
+5. AI router resilience: simulate all providers returning 429; bot continues on deterministic rules.
+
+Only after all five pass: enable real money one adapter at a time — Polymarket → perps (testnet additional week) → memecoins last, hard cap still active.
+
+9.2 Shadow P&L schema
+
+```sql
+CREATE TABLE shadow_pnl (
+    id INTEGER PRIMARY KEY,
+    adapter TEXT, symbol TEXT, side TEXT,
+    strategy_id TEXT,
+    entry_price REAL, exit_price REAL, size REAL,
+    notional_usd REAL, pnl_usd REAL,
+    slippage_assumed_bps REAL,
+    mae_usd REAL,             -- max adverse excursion
+    opened_at TEXT, closed_at TEXT,
+    status TEXT               -- OPEN | CLOSED
+);
+```
+
+Daily report (demo/report.py): per-adapter net P&L, win rate, avg hold, MAE, number of gate rejections by reason, number of AI reviewer rejections.
+
+---
+
+10. Phased Roadmap
+
+Phase Duration Deliverable Gate to next
+0. Scaffold 3–5 days New repo tree, contract tests, config loader Contract tests green
+1. Kernel 1 week risk_engine, journal, order_lifecycle, message bus Unit tests + restart recovery
+2. Perp adapter 1 week Binance testnet end-to-end Testnet fill + journal match
+3. Polymarket adapter 1 week CLOB auth + shadow quotes + market maker Shadow P&L reconciles
+4. Memecoin adapter 1 week Jupiter + safety filter, dry_run Filter rejects known bad token
+5. AI router + reflector 1 week Cascade failover, reflection loop 429 resilience test passes
+6. DSL + backtest gate 1 week Schema, compiler, validator, OOS backtest Reject invalid DSL in tests
+7. 3-week demo 3 weeks Shadow P&L, reconciliation, report Go/no-go criteria met
+8. Live rollout 2–4 weeks One adapter at a time, real money Per-adapter 2-week profit & no breaches
+9. Fine-tune reviewer post-demo QLoRA reviewer model Reviewer improves shadow metrics
+10. Future: sports/event markets TBD Additional adapter on same contract Reuse kernel unchanged
+
+Total to go/no-go: ~8–9 weeks of build + 3 weeks demo ≈ 11–12 weeks.
+
+---
+
+11. Future Improvements (Post v1.0)
+
+1. Sports/event markets adapter. Same BaseAdapter contract; new strategy DSL triggers (odds_deviation, line_movement). Reuses kernel and risk engine unchanged. This is the natural extension the user flagged.
+2. Rust execution sidecar for Solana. When latency becomes the bottleneck, move memecoin tx construction and send into a Rust binary invoked via gRPC. Python stays for strategy and risk.
+3. Multi-DEX memecoin routing. Add Raydium direct, Orca, Meteora after Jupiter-only v1.0 proves stable.
+4. Reinforcement learning for sizing. After 1,000+ live trades, train a small RL policy for position sizing only (not entry). TradePool-style GRPO is the reference pattern.
+5. Cross-market correlation model. A learned covariance matrix across the three markets to replace the fixed correlation penalty in position_sizing.py.
+6. Strategy DSL mutation loop. Once the reflector + backtest gate is proven, allow the LLM to mutate structure (add a trigger, remove a guard) with stricter OOS thresholds.
+7. Observability. Prometheus metrics + Grafana dashboard per adapter (latency, gate rejections, AI provider health).
+
+---
+
+12. Assumptions and Open Questions
+
+· Free-tier quotas shift frequently. The router is designed to cascade; verify per-provider limits before demo week.
+· Polymarket geofencing. CLOB trading is restricted in some jurisdictions. Confirm eligibility before wiring L2 credentials.
+· coinscan-sdk daily limit (25) constrains memecoin candidate throughput during demo. If more is needed, add a second scanner API (paid or alternate free) behind the same interface.
+· Sports/event markets mentioned by the user are deferred to Phase 10. The kernel supports them without change; only a new adapter and DSL triggers are needed.
+· "Perfect" is a process, not a state. The system improves via the reflector → backtest gate → shadow validation loop. Every strategy change must pass OOS validation before touching live capital.
+
+---
+
+13. Immediate Next Actions (This Week)
+
+1. Create the new repo NEXUS-TONYBOT, copy TONYBOT tree, remove stray =6.0.0.
+2. Write core/adapters/base.py and tests/test_adapter_contract.py.
+3. Port NEXUS journal.py → core/kernel/journal.py; add strategy_versions and reflections tables.
+4. Port NEXUS risk_governor.py → core/kernel/risk_engine.py with USD notional and hard caps.
+5. Stub all three adapters; make contract tests pass in dry-run.
+6. Stand up Redis (or SQLite queue) and the adapter registry.
+
+Once those six are done, Phase 1 is complete and Phase 2 (perp adapter on testnet) can start.
+
+---
+
+Document version 1.0. Update after each phase gate. All secret handling follows the non-negotiable constraints in §1.3.You are right. The previous plan focused on "how to combine the two projects," but what you want is not a simple merger—it is a self-evolving trading system. The key is not how many indicators you stack, but whether the system can turn "what it has learned" into weight updates that take effect the next time, rather than just storing them as prompt words. Below is the implementation plan around this goal.
+
+Core Judgment: Self-Evolution Under Free Tiers is Feasible, But the Path Must Be Right
+
+Your idea of "letting AI read research, learn strategies, and document them" has a fatal flaw under free tiers: the context window and reasoning depth of free LLMs are not enough to directly produce reliable trading code. But there is an alternative: let the LLM handle "reflection and mutation," not "generation from scratch." The self-evolving stock strategy agent AlphaEvo proves this path works—it uses the LLM to diagnose failed strategies, modify DSL parameters, and in 3 iterations turned a win-rate 8.1% ineffective strategy into a 52.7% champion strategy. Your system can borrow this pattern: the LLM is responsible for reviewing failures, not for writing new strategies.
+
+More importantly, if you want evolution to be "perfected," the final carrier of knowledge should be model weights, not prompt words. The TradePool project trained a coding agent that writes trading strategies using reinforcement learning (GRPO), and after training, even if the "discipline rules" in the prompt were deleted, the model still behaved in a disciplined manner—proving that the rules entered the weights. This is the direction you should pursue: not letting the AI "remember" strategies, but letting the AI "become" a better strategy reviewer through small-scale fine-tuning.
+
+---
+
+Implementation Plan: Three-Layer Evolution Architecture
+
+Layer One: Free LLM Routing + Reflection Loop (Immediate Implementation, Zero Cost)
+
+Directly integrate a free LLM router into the kernel. Based on current free-tier quotas, Groq + Gemini + Cerebras combined are sufficient for reflection loops at trading frequency. The key is automatic failover: when one provider returns 429, automatically switch to the next, without interrupting the reflection flow.
+
+Concrete implementation:
+
+```python
+# ai/reflector.py
+async def reflect_failed_trade(trade_record: dict, current_strategy: dict) -> dict:
+    prompt = f"""
+    A trade failed. Diagnose why and propose ONE parameter change.
+    
+    Trade: {json.dumps(trade_record)}
+    Current strategy params: {json.dumps(current_strategy['params'])}
+    
+    Return JSON only: {{"diagnosis": "...", "param_to_change": "...", "old_value": ..., "new_value": ...}}
+    """
+    response = await llm_router.ask(prompt)  # cascading failover
+    return json.loads(response)
+```
+
+What this layer can achieve: After each losing trade, automatically adjust one parameter (e.g., RSI threshold, stop-loss ATR multiplier). AlphaEvo's practice shows that this kind of "single-step mutation + backtest validation" converges much faster than letting the LLM freely generate new strategies.
+
+What this layer cannot achieve: The LLM will not truly "understand" the market; it is only doing pattern matching and parameter tuning. All knowledge exists in SQLite (strategy version table), not in the model.
+
+Layer Two: Strategy DSL + Backtest Validation Closed Loop (1–2 Weeks of Development)
+
+Before you let the AI modify strategies, you must have a machine-verifiable strategy representation. Do not let the LLM generate Python code directly—have it generate YAML DSL, then have the kernel compile the DSL into executable logic. AlphaEvo's DSL structure is worth borrowing: trigger conditions, guard conditions, stop-loss/take-profit, and parameter ranges are all written explicitly, and the LLM can read and modify them.
+
+Your DSL needs to cover the characteristics of three markets:
+
+```yaml
+strategy:
+  id: memecoin_momentum_v1
+  market: solana_memecoin
+  triggers:
+    - indicator: rsi
+      period: 7
+      condition: "< 30"
+    - indicator: volume_spike
+      multiplier: 1.5
+  guards:
+    - safety_filter: passed   # Must be true, otherwise do not enter
+    - max_notional_usd: 25
+  exit:
+    stop_loss: { type: atr, multiplier: 2.0 }
+    take_profit: { type: r_multiple, value: 2.0 }
+```
+
+Critical rule: Any parameter change proposed by the LLM must pass backtest validation on the same period (out-of-sample) before being applied to the shadow run. Before backtest validation passes, the strategy version does not take effect. This prevents the LLM from "sounding reasonable but actually getting worse."
+
+Layer Three: Small-Scale Fine-Tuning (After the 3-Week Demo, If Data Is Sufficient)
+
+This is the step that truly makes the system "perfect." During the 3-week demo, each trade you record (entry reason, market context, LLM reflection conclusion, final P&L) is a training sample. After accumulating 500–1000 samples, you can use QLoRA to fine-tune an open-source small model (e.g., Llama 3.1 8B or Qwen) on a single GPU, so that it learns "what kind of trade this system should reject and what kind it should let through".
+
+What you need to prepare:
+
+1. Training data format: {"messages": [{"role": "system", "content": "You are a trade reviewer for NEXUS/TONYBOT"}, {"role": "user", "content": "Trade proposal: ... Market: ..."}, {"role": "assistant", "content": "REJECT. Reason: safety filter flagged bundle_pct > 0.45."}]}
+2. Labeling source: The labels are not manually written by you, but are automatically labeled based on the final P&L of the shadow/demo trades. Winning trades → "should execute"; losing trades that passed the safety filter → "should reject, reason X." Let the LLM (using a stronger free model) generate the reason text.
+3. Training cost: QLoRA fine-tuning of an 8B model requires only one GPU with 16–24GB VRAM, and a few hours of training. You can run it on Colab free tier or a local GPU.
+
+What is the fine-tuned model used for? Not to replace the trading logic, but to serve as a "trade proposal reviewer": before each order enters the risk kernel, the fine-tuned model quickly gives a reject/approve judgment. This is the "personalization" you mentioned—the model learns the preferences of this system (which memecoins tend to be honeypots, what market conditions perps are prone to false breakouts). But it is only an additional filter layer; it cannot bypass the risk kernel's hard limits.
+
+---
+
+Additional Indicators and Strategies: What to Add and What Not to Add
+
+Indicators: The current 7 indicators (RSI, MACD, Bollinger, SuperTrend, VWAP, Stochastic, EMA Cross) are sufficient for perps and memecoins. Do not add more. The value of indicators lies in combination, not in quantity. What you need to add is market structure indicators:
+
+· Memecoins: Holder concentration change rate (using coinscan's holders_map), large holder sell monitoring.
+· Perps: Funding rate Z-score, long-short ratio extreme values, liquidation heatmap density.
+· Polymarket: Probability change velocity (first derivative), liquidity depth, event time decay.
+
+Strategies: The setup scanner currently has three types (Pullback, Breakout, RSI Divergence). For the three markets, add:
+
+· Memecoins: "Safety filter + volume spike + short-term momentum" three-condition trigger, holding period ≤ 30 minutes.
+· Polymarket: "Probability deviation + time decay" — when the market's implied probability differs from the LLM's estimated probability by more than 8 percentage points, and the market has more than 7 days to expire, take a position.
+
+What not to do: Do not try to use the same set of strategies across all three markets. The market microstructure of memecoins and Polymarket is completely different; forcing unification will only produce a system that performs mediocrely in all three.
+
+---
+
+Impact on the 3-Week Demo Plan
+
+The original 3-week demo plan remains unchanged. The only adjustment: introduce the reflection loop from Layer One starting from Week 2, and record the LLM's diagnosis and parameter change proposals for each losing trade. After the demo ends, you will have:
+
+· A shadow P&L record
+· A set of "LLM-proposed but not yet validated" parameter variants
+· A dataset of at least 200–500 trade records with context and results
+
+The third item is the training data for Layer Three. Without the demo data, fine-tuning is castle in the air.
+
+---
+
+Final Advice
+
+You want "perfection," but the path to perfection is not to let the AI learn everything at once. It is to make the AI learn one thing at a time: first let it learn to reject bad trades (the fine-tuned reviewer), then let it learn to adjust parameters (the reflection loop), and finally consider letting it propose new strategy logic (the DSL mutation loop). Each step must be validated by backtest + shadow run before proceeding to the next. TradePool's RL training also started from 50 steps and a reward of 0.15, slowly climbing up. Your system should do the same.

@@ -1,0 +1,6 @@
+{
+  "name": "NEXUS × TONYBOT — Unified Multi-Market Trading Platform",
+  "description": "Market-agnostic trading kernel with pluggable adapters for Solana Memecoins (Jupiter + CoinScan), Polymarket CLOB (EIP-712), and Binance Futures, powered by a self-evolving 3-layer AI architecture and 3-week shadow demo monitor.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
