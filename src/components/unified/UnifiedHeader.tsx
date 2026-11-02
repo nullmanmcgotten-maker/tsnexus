@@ -12,6 +12,7 @@ import {
   Scale,
   TrendingUp,
   FileCode,
+  HardDrive,
 } from 'lucide-react';
 
 interface UnifiedHeaderProps {
@@ -21,6 +22,8 @@ interface UnifiedHeaderProps {
   onEmergencyKill: () => void;
   activeTab: string;
   setActiveTab: (tab: string) => void;
+  activeAppSource?: 'drive' | 'tsnexus';
+  activeDriveProjectName?: string;
 }
 
 export const UnifiedHeader: React.FC<UnifiedHeaderProps> = ({
@@ -30,6 +33,8 @@ export const UnifiedHeader: React.FC<UnifiedHeaderProps> = ({
   onEmergencyKill,
   activeTab,
   setActiveTab,
+  activeAppSource = 'drive',
+  activeDriveProjectName,
 }) => {
   const [utcTime, setUtcTime] = useState('');
   const [showKillConfirm, setShowKillConfirm] = useState(false);
@@ -45,6 +50,7 @@ export const UnifiedHeader: React.FC<UnifiedHeaderProps> = ({
   }, []);
 
   const navTabs = [
+    { id: 'drive_app', label: 'Google Drive App', icon: HardDrive, badge: 'Drive' },
     { id: 'cockpit', label: 'Multi-Market Cockpit', icon: Layers },
     { id: 'rust_kernel', label: 'Rust Hot Path', icon: Cpu, badge: '<1µs' },
     { id: 'risk_kernel', label: 'Risk Kernel (USD Caps)', icon: ShieldCheck },
@@ -91,6 +97,21 @@ export const UnifiedHeader: React.FC<UnifiedHeaderProps> = ({
             <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-cyan-500/10 text-cyan-300 border border-cyan-500/30">
               SHADOW DEMO (DRY_RUN=TRUE)
             </span>
+          </div>
+
+          {/* Active App Source Indicator */}
+          <div className="flex items-center gap-1.5 hidden md:flex">
+            <span className="text-slate-500">SOURCE:</span>
+            {activeAppSource === 'drive' ? (
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-500/20 text-blue-300 border border-blue-500/40 flex items-center gap-1">
+                <HardDrive className="w-3 h-3 text-blue-400" />
+                GOOGLE DRIVE {activeDriveProjectName ? `(${activeDriveProjectName})` : ''}
+              </span>
+            ) : (
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 border border-slate-700">
+                TSNEXUS
+              </span>
+            )}
           </div>
 
           {/* Circuit breaker */}

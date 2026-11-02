@@ -137,6 +137,11 @@ export class UnifiedJournal {
     return [...this.orders];
   }
 
+  loadExternalOrders(newOrders: UnifiedOrderRecord[]) {
+    this.orders = [...newOrders];
+    this.persist();
+  }
+
   recordOrder(order: UnifiedOrderRecord) {
     const idx = this.orders.findIndex((o) => o.id === order.id);
     if (idx >= 0) {

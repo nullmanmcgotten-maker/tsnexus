@@ -7,6 +7,7 @@ import { StrategyDSLTab } from './components/unified/StrategyDSLTab.tsx';
 import { CoinScanSafetyTab } from './components/unified/CoinScanSafetyTab.tsx';
 import { DemoGoNoGoTab } from './components/unified/DemoGoNoGoTab.tsx';
 import { RustKernelTab } from './components/unified/RustKernelTab.tsx';
+import { GoogleDriveAppTab } from './components/unified/GoogleDriveAppTab.tsx';
 import { JournalTab } from './components/JournalTab.tsx';
 import {
   RiskEngineConfig,
@@ -16,12 +17,16 @@ import {
 import { DEFAULT_RISK_CONFIG, UnifiedRiskEngine } from './core/kernel/riskEngine.ts';
 import { unifiedJournal } from './core/kernel/journal.ts';
 import { adapterRegistry } from './core/adapters/registry.ts';
+import { DriveProjectBundle } from './core/drive/driveService.ts';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<string>('cockpit');
+  const [activeTab, setActiveTab] = useState<string>('drive_app');
   const [isArmed, setIsArmed] = useState<boolean>(true);
   const [dailyLossTripped, setDailyLossTripped] = useState<boolean>(false);
   const [riskEngine] = useState<UnifiedRiskEngine>(() => new UnifiedRiskEngine(DEFAULT_RISK_CONFIG));
+
+  const [activeAppSource, setActiveAppSource] = useState<'drive' | 'tsnexus'>('drive');
+  const [activeDriveProject, setActiveDriveProject] = useState<DriveProjectBundle | null>(null);
 
   const [positions, setPositions] = useState<UnifiedPosition[]>([]);
   const [orders, setOrders] = useState<UnifiedOrderRecord[]>([]);
@@ -65,9 +70,22 @@ export function App() {
         onEmergencyKill={handleEmergencyKill}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        activeAppSource={activeAppSource}
+        activeDriveProjectName={activeDriveProject?.projectName}
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6">
+        {activeTab === 'drive_app' && (
+          <GoogleDriveAppTab
+            riskEngine={riskEngine}
+            onUpdateRiskConfig={handleUpdateRiskConfig}
+            onRefreshOrders={() => setOrders(unifiedJournal.getOrders())}
+            activeAppSource={activeAppSource}
+            setActiveAppSource={setActiveAppSource}
+            activeDriveProject={activeDriveProject}
+            setActiveDriveProject={setActiveDriveProject}
+          />
+        )}
         {activeTab === 'cockpit' && (
           <MarketCockpitTab
             riskEngine={riskEngine}
