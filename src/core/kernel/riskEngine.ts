@@ -1,4 +1,4 @@
-import { Market, Quote, RiskEngineConfig, UnifiedPosition } from '../../types/unified.ts';
+import { Quote, RiskEngineConfig, UnifiedPosition } from '../../types/unified.ts';
 
 export const DEFAULT_RISK_CONFIG: RiskEngineConfig = {
   total_capital_usd: 10000.0,
@@ -18,15 +18,58 @@ export const DEFAULT_RISK_CONFIG: RiskEngineConfig = {
   funding_budget_usd: 30.0, // $30 projected daily funding budget
 };
 
-export class UnifiedRiskEngine {
-  constructor(private cfg: RiskEngineConfig = DEFAULT_RISK_CONFIG) {}
+// Keep the documented limits immutable even if a caller holds a reference to defaults.
+Object.freeze(DEFAULT_RISK_CONFIG.market_caps);
+Object.freeze(DEFAULT_RISK_CONFIG.hard_caps_usd);
+Object.freeze(DEFAULT_RISK_CONFIG);
 
-  getConfig(): RiskEngineConfig {
-    return { ...this.cfg };
+const cloneConfig = (config: RiskEngineConfig): RiskEngineConfig => ({
+  ...config,
+  market_caps: { ...config.market_caps },
+  hard_caps_usd: { ...config.hard_caps_usd },
+});
+
+export class UnifiedRiskEngine {
+  private cfg: RiskEngineConfig;
+
+  constructor(config: RiskEngineConfig = DEFAULT_RISK_CONFIG) {
+    this.cfg = cloneConfig(config);
   }
 
-  updateConfig(updated: Partial<RiskEngineConfig>) {
-    this.cfg = { ...this.cfg, ...updated };
+  getConfig(): RiskEngineConfig {
+    return cloneConfig(this.cfg);
+  }
+
+  updateConfig(updated: Partial<RiskEngineConfig>): void {
+    const next = { ...this.cfg, ...updated };
+    const validatePositiveNumber = (name: string, value: number, max?: number) => {
+      if (!Number.isFinite(value) || value <= 0 || (max !== undefined && value > max)) {
+        throw new RangeError(`${name} must be finite, positive${max === undefined ? '' : `, and no greater than ${max}`}`);
+      }
+    };
+
+    validatePositiveNumber('total_capital_usd', next.total_capital_usd);
+    validatePositiveNumber('max_total_exposure_pct', next.max_total_exposure_pct, DEFAULT_RISK_CONFIG.max_total_exposure_pct);
+    validatePositiveNumber('max_daily_loss_pct', next.max_daily_loss_pct, DEFAULT_RISK_CONFIG.max_daily_loss_pct);
+    validatePositiveNumber('max_drawdown_pct', next.max_drawdown_pct, DEFAULT_RISK_CONFIG.max_drawdown_pct);
+    validatePositiveNumber('funding_budget_usd', next.funding_budget_usd, DEFAULT_RISK_CONFIG.funding_budget_usd);
+
+    for (const [adapter, limit] of Object.entries(next.market_caps)) {
+      const documentedLimit = DEFAULT_RISK_CONFIG.market_caps[adapter as keyof typeof DEFAULT_RISK_CONFIG.market_caps];
+      if (documentedLimit === undefined) throw new RangeError(`Unknown market cap adapter: ${adapter}`);
+      validatePositiveNumber(`market_caps.${adapter}`, limit, documentedLimit);
+    }
+    for (const [adapter, limit] of Object.entries(next.hard_caps_usd)) {
+      const documentedLimit = DEFAULT_RISK_CONFIG.hard_caps_usd[adapter as keyof typeof DEFAULT_RISK_CONFIG.hard_caps_usd];
+      if (documentedLimit === undefined) throw new RangeError(`Unknown hard cap adapter: ${adapter}`);
+      validatePositiveNumber(`hard_caps_usd.${adapter}`, limit, documentedLimit);
+    }
+
+    this.cfg = cloneConfig({
+      ...next,
+      market_caps: { ...this.cfg.market_caps, ...updated.market_caps },
+      hard_caps_usd: { ...this.cfg.hard_caps_usd, ...updated.hard_caps_usd },
+    });
   }
 
   /**
@@ -49,7 +92,6 @@ export class UnifiedRiskEngine {
     }
 
     // 1. Mandatory Safety Filter PRECEDENCE (Memecoins only)
-    // Non-negotiable constraint: Runs before risk kernel, not after.
     if (q.adapter === 'solana_memecoin') {
       const safety = q.metadata?.safety;
       if (!safety || !safety.passed) {
@@ -61,36 +103,24 @@ export class UnifiedRiskEngine {
         };
       }
 
-      // Check max hold time (30 min limit) and max slippage (300 bps)
       if (q.slippage_bps > 300) {
-        return {
-          approved: false,
-          reason: 'slippage_cap_exceeded_300bps',
-        };
+        return { approved: false, reason: 'slippage_cap_exceeded_300bps' };
       }
 
-      // Check daily new meme positions count <= 3
       const memePositions = openPositions.filter((p) => p.adapter === 'solana_memecoin');
       if (memePositions.length >= 3) {
-        return {
-          approved: false,
-          reason: 'daily_meme_positions_limit_reached',
-        };
+        return { approved: false, reason: 'daily_meme_positions_limit_reached' };
       }
     }
 
-    // 2. Polymarket Boundary Check (Reject <0.02 or >0.98 near-resolution markets)
-    if (q.adapter === 'polymarket') {
-      if (q.price < 0.02 || q.price > 0.98) {
-        return {
-          approved: false,
-          reason: 'polymarket_near_resolution_extreme_risk',
-          details: { price: q.price },
-        };
-      }
+    if (q.adapter === 'polymarket' && (q.price < 0.02 || q.price > 0.98)) {
+      return {
+        approved: false,
+        reason: 'polymarket_near_resolution_extreme_risk',
+        details: { price: q.price },
+      };
     }
 
-    // 3. Absolute Hard USD Cap Check
     if (q.notional_usd > hardCap) {
       return {
         approved: false,
@@ -99,7 +129,6 @@ export class UnifiedRiskEngine {
       };
     }
 
-    // 4. Cross-Market Total Exposure Cap (30%)
     const currentTotalExposure = openPositions.reduce((acc, p) => acc + p.notional_usd, 0);
     if (currentTotalExposure + q.notional_usd > capital * this.cfg.max_total_exposure_pct) {
       return {
@@ -113,7 +142,6 @@ export class UnifiedRiskEngine {
       };
     }
 
-    // 5. Per-Market Sub-Cap Check (Perp: 15%, Poly: 10%, Meme: 5%)
     const currentMarketExposure = openPositions
       .filter((p) => p.adapter === q.adapter)
       .reduce((acc, p) => acc + p.notional_usd, 0);
@@ -132,7 +160,6 @@ export class UnifiedRiskEngine {
       };
     }
 
-    // 6. Daily Loss Circuit Breaker Check (2%)
     const dailyLossPct = Math.max(0, -dailyLossUsd) / capital;
     if (dailyLossPct >= this.cfg.max_daily_loss_pct) {
       return {
@@ -142,7 +169,6 @@ export class UnifiedRiskEngine {
       };
     }
 
-    // 7. Max Drawdown Circuit Breaker Check (15%)
     const currentDrawdownPct = Math.max(0, peakCapitalUsd - (capital + dailyLossUsd)) / peakCapitalUsd;
     if (currentDrawdownPct >= this.cfg.max_drawdown_pct) {
       return {
@@ -152,11 +178,10 @@ export class UnifiedRiskEngine {
       };
     }
 
-    // 8. Perp Funding Cost Budget Check
     if (q.adapter === 'perp_binance') {
       const projectedFundingCost = openPositions
         .filter((p) => p.adapter === 'perp_binance')
-        .reduce((sum, p) => sum + p.notional_usd * 0.0003 * 3, 0); // 3 funding intervals/day
+        .reduce((sum, p) => sum + p.notional_usd * 0.0003 * 3, 0);
 
       if (projectedFundingCost >= this.cfg.funding_budget_usd) {
         return {
@@ -167,9 +192,6 @@ export class UnifiedRiskEngine {
       }
     }
 
-    return {
-      approved: true,
-      reason: 'approved',
-    };
+    return { approved: true, reason: 'approved' };
   }
 }

@@ -8,10 +8,11 @@ import { createServer as createViteServer } from 'vite';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const ALLOWED_TONYBOT_ACTIONS = new Set(['BUY', 'SELL', 'CLOSE', 'ALERT']);
+
 interface TonyBotWebhookPayload {
-  token?: string;
-  symbol: string;
-  action: 'BUY' | 'SELL' | 'CLOSE' | 'ALERT';
+  symbol?: unknown;
+  action?: unknown;
   setup?: string;
   confidence?: number;
   entry?: number;
@@ -20,13 +21,19 @@ interface TonyBotWebhookPayload {
   notes?: string;
 }
 
+type RequestWithRawBody = express.Request & { rawBody?: Buffer };
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({
+    limit: '1mb',
+    verify: (req, _res, body) => {
+      (req as RequestWithRawBody).rawBody = Buffer.from(body);
+    },
+  }));
 
-  // Health check
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
@@ -38,62 +45,42 @@ async function startServer() {
     });
   });
 
-  // AI Router proxy with Google Gemini fallback
   app.post('/api/ai/ask', async (req, res) => {
-    const { prompt, jsonMode } = req.body;
+    const { prompt, jsonMode } = req.body ?? {};
+    if (typeof prompt !== 'string' || prompt.trim().length === 0) {
+      return res.status(400).json({ error: 'prompt required' });
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({ error: 'AI reviewer unavailable; use deterministic risk checks' });
+    }
+
     try {
-      if (process.env.GEMINI_API_KEY) {
-        const { GoogleGenAI } = await import('@google/genai');
-        const ai = new GoogleGenAI({});
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-          config: jsonMode ? { responseMimeType: 'application/json' } : undefined,
-        });
-        return res.json({ text: response.text });
-      }
-    } catch (e: any) {
-      console.warn('[SERVER AI ROUTE EXCEPTION]', e.message);
-    }
-
-    // Return synthesized structured response if unconfigured
-    if (prompt.includes('Diagnose this failed trade')) {
-      return res.json({
-        text: JSON.stringify({
-          diagnosis: 'Trade exited due to adverse flow volatility into overhead resistance.',
-          param_to_change: 'stop_loss_multiplier',
-          old_value: 2.0,
-          new_value: 1.8,
-          expected_sharpe_delta: 0.18,
-        }),
+      const { GoogleGenAI } = await import('@google/genai');
+      const ai = new GoogleGenAI({});
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: jsonMode ? { responseMimeType: 'application/json' } : undefined,
       });
+      return res.json({ text: response.text });
+    } catch (error: any) {
+      console.warn('[SERVER AI ROUTE EXCEPTION]', error.message);
+      return res.status(503).json({ error: 'AI reviewer unavailable; use deterministic risk checks' });
     }
-
-    if (prompt.includes('probability estimate')) {
-      return res.json({
-        text: JSON.stringify({
-          estimated_probability: 0.76,
-          confidence: 0.85,
-          rationale: 'Consensus indicators show sustained statistical momentum.',
-        }),
-      });
-    }
-
-    return res.json({
-      text: JSON.stringify({
-        verdict: 'NO_OBJECTION',
-        reason: 'Trade within acceptable risk bounds and passed safety checks.',
-      }),
-    });
   });
 
-  // Binance live market data proxy (safe from CORS)
   app.get('/api/binance/market', async (req, res) => {
-    const symbol = (req.query.symbol as string) || 'BTCUSDT';
+    const querySymbol = req.query.symbol;
+    const symbol = querySymbol === undefined ? 'BTCUSDT' : querySymbol;
+    if (typeof symbol !== 'string' || !/^[A-Z0-9]{3,20}$/.test(symbol)) {
+      return res.status(400).json({ error: 'invalid symbol' });
+    }
+    const encodedSymbol = encodeURIComponent(symbol);
+
     try {
       const [bookRes, premiumRes] = await Promise.all([
-        fetch(`https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${symbol}`),
-        fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`),
+        fetch(`https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${encodedSymbol}`),
+        fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodedSymbol}`),
       ]);
 
       if (bookRes.ok && premiumRes.ok) {
@@ -119,14 +106,13 @@ async function startServer() {
         });
       }
     } catch {
-      // Fallback if network blocked
+      // Fall back to clearly marked simulated data if the public API is unavailable.
     }
 
-    // Default simulated market data
     const basePrice = symbol.startsWith('ETH') ? 3500 : symbol.startsWith('SOL') ? 180 : 65000;
     const spreadBps = 0.6;
     const spread = (basePrice * spreadBps) / 10000;
-    res.json({
+    return res.json({
       symbol,
       price: basePrice,
       bid: basePrice - spread / 2,
@@ -141,11 +127,10 @@ async function startServer() {
     });
   });
 
-  // Signed Binance account validator
   app.post('/api/binance/account', async (req, res) => {
-    const { apiKey, apiSecret, testnet } = req.body;
+    const { apiKey, apiSecret, testnet } = req.body ?? {};
 
-    if (!apiKey || !apiSecret) {
+    if (typeof apiKey !== 'string' || !apiKey || typeof apiSecret !== 'string' || !apiSecret) {
       return res.status(503).json({
         ok: false,
         can_trade: false,
@@ -160,15 +145,9 @@ async function startServer() {
     try {
       const timestamp = Date.now();
       const queryString = `timestamp=${timestamp}&recvWindow=5000`;
-      const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(queryString)
-        .digest('hex');
-
+      const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
       const binanceRes = await fetch(`${targetUrl}/fapi/v2/account?${queryString}&signature=${signature}`, {
-        headers: {
-          'X-MBX-APIKEY': apiKey,
-        },
+        headers: { 'X-MBX-APIKEY': apiKey },
       });
 
       if (!binanceRes.ok) {
@@ -183,12 +162,11 @@ async function startServer() {
 
       const account = await binanceRes.json();
       const positions = (account.positions || []).filter(
-        (p: any) => Math.abs(parseFloat(p.positionAmt || '0')) > 0
+        (position: any) => Math.abs(parseFloat(position.positionAmt || '0')) > 0
       );
       const wallet = parseFloat(account.totalWalletBalance || '0');
       const available = parseFloat(account.availableBalance || '0');
       const canTrade = Boolean(account.canTrade);
-
       const reasons: string[] = [];
       if (!canTrade) reasons.push('exchange_can_trade_false');
       if (available <= 0) reasons.push('no_available_balance');
@@ -204,56 +182,65 @@ async function startServer() {
         checked_at: new Date().toISOString(),
         mode: 'LIVE_SIGNED',
       });
-    } catch (err: any) {
+    } catch (error: any) {
       return res.status(500).json({
         ok: false,
         can_trade: false,
-        reason_codes: [`account_validation_exception: ${err.message}`],
+        reason_codes: [`account_validation_exception: ${error.message}`],
         checked_at: new Date().toISOString(),
       });
     }
   });
 
-  // Telegram Notifier proxy
+  // Credentials and destination are server-side only; callers may supply message text only.
   app.post('/api/telegram/notify', async (req, res) => {
-    const { token, chatId, text } = req.body;
-
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const { text } = req.body ?? {};
     if (!token || !chatId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Missing telegram_bot_token or telegram_chat_id',
-      });
+      return res.status(503).json({ ok: false, error: 'Telegram notifier is not configured on the server' });
+    }
+    if (typeof text !== 'string' || text.length === 0 || text.length > 4000) {
+      return res.status(400).json({ ok: false, error: 'text required (maximum 4000 characters)' });
     }
 
     try {
       const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text,
-          parse_mode: 'HTML',
-        }),
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
       });
-
       const data = await response.json();
-      return res.json({ ok: response.ok, response: data });
+      return res.status(response.ok ? 200 : 502).json({ ok: response.ok, response: data });
     } catch (error: any) {
-      return res.status(500).json({ ok: false, error: error.message });
+      return res.status(502).json({ ok: false, error: error.message });
     }
   });
 
-  // TonyBot Webhook Signal Ingestion (Companion bot integration for nullmanmcgotten-maker/TONYBOT)
   app.post('/api/tonybot/webhook', (req, res) => {
-    const payload: TonyBotWebhookPayload = req.body;
-    console.log('[TONYBOT WEBHOOK RECEIVED]', payload);
-
-    if (!payload.symbol || !payload.action) {
-      return res.status(400).json({ error: 'symbol and action are required' });
+    const secret = process.env.TONYBOT_WEBHOOK_SECRET;
+    const signature = String(req.get('x-tonybot-signature') ?? '');
+    const rawBody = (req as RequestWithRawBody).rawBody;
+    if (!secret || !rawBody || !/^[a-f0-9]{64}$/i.test(signature)) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest();
+    const received = Buffer.from(signature, 'hex');
+    if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
+      return res.status(401).json({ error: 'unauthorized' });
     }
 
+    const payload = req.body as TonyBotWebhookPayload | undefined;
+    if (!payload || typeof payload.symbol !== 'string' || !/^[A-Z0-9]{3,20}$/.test(payload.symbol)) {
+      return res.status(400).json({ error: 'valid symbol is required' });
+    }
+    if (typeof payload.action !== 'string' || !ALLOWED_TONYBOT_ACTIONS.has(payload.action)) {
+      return res.status(400).json({ error: 'invalid action' });
+    }
+
+    console.log('[TONYBOT WEBHOOK RECEIVED]', { symbol: payload.symbol, action: payload.action });
     const signalId = `TONY-HOOK-${Date.now().toString(36).toUpperCase()}`;
-    res.json({
+    return res.json({
       success: true,
       signal_id: signalId,
       status: 'QUEUED_FOR_NEXUS_EVALUATION',
@@ -262,12 +249,8 @@ async function startServer() {
     });
   });
 
-  // Dev server with Vite vs Production static serving
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
@@ -277,8 +260,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`NEXUS Engine Server online at http://0.0.0.0:${PORT}`);
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`NEXUS Engine Server online at http://127.0.0.1:${PORT}`);
   });
 }
 
