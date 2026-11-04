@@ -32,7 +32,7 @@ async function startServer() {
       status: 'ok',
       engine: 'NEXUS-TONYBOT-UNIFIED-v1.0',
       kernel: 'market-agnostic-usd-notional',
-      adapters: ['perp_binance', 'polymarket_clob', 'solana_memecoin'],
+      adapters: ['perp_binance', 'polymarket', 'solana_memecoin'],
       ai_layer: 'cascading-router-active',
       timestamp: new Date().toISOString(),
     });
@@ -143,25 +143,19 @@ async function startServer() {
 
   // Signed Binance account validator
   app.post('/api/binance/account', async (req, res) => {
-    const { apiKey, apiSecret, testnet, baseUrl } = req.body;
+    const { apiKey, apiSecret, testnet } = req.body;
 
     if (!apiKey || !apiSecret) {
-      return res.json({
-        ok: true,
-        can_trade: true,
-        account_type: 'SIMULATION_ENVIRONMENT',
-        wallet_balance: 10000.0,
-        available_balance: 8450.0,
-        positions: 1,
-        reason_codes: [],
+      return res.status(503).json({
+        ok: false,
+        can_trade: false,
+        reason_codes: ['binance_credentials_not_configured'],
         checked_at: new Date().toISOString(),
-        mode: 'SIMULATED',
+        mode: 'UNCONFIGURED',
       });
     }
 
-    const targetUrl = testnet
-      ? 'https://testnet.binancefuture.com'
-      : baseUrl || 'https://fapi.binance.com';
+    const targetUrl = testnet ? 'https://testnet.binancefuture.com' : 'https://fapi.binance.com';
 
     try {
       const timestamp = Date.now();

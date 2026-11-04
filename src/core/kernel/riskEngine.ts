@@ -41,6 +41,13 @@ export class UnifiedRiskEngine {
   ): Promise<{ approved: boolean; reason: string; details?: Record<string, any> }> {
     const capital = this.cfg.total_capital_usd;
 
+    // Unknown adapters must never bypass caps due to undefined comparisons.
+    const hardCap = this.cfg.hard_caps_usd[q.adapter];
+    const marketCapPct = this.cfg.market_caps[q.adapter];
+    if (hardCap === undefined || marketCapPct === undefined) {
+      return { approved: false, reason: 'unknown_adapter_fail_closed' };
+    }
+
     // 1. Mandatory Safety Filter PRECEDENCE (Memecoins only)
     // Non-negotiable constraint: Runs before risk kernel, not after.
     if (q.adapter === 'solana_memecoin') {
@@ -84,7 +91,6 @@ export class UnifiedRiskEngine {
     }
 
     // 3. Absolute Hard USD Cap Check
-    const hardCap = this.cfg.hard_caps_usd[q.adapter];
     if (q.notional_usd > hardCap) {
       return {
         approved: false,
@@ -111,7 +117,7 @@ export class UnifiedRiskEngine {
     const currentMarketExposure = openPositions
       .filter((p) => p.adapter === q.adapter)
       .reduce((acc, p) => acc + p.notional_usd, 0);
-    const marketLimit = capital * this.cfg.market_caps[q.adapter];
+    const marketLimit = capital * marketCapPct;
 
     if (currentMarketExposure + q.notional_usd > marketLimit) {
       return {
